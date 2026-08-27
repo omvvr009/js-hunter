@@ -1,0 +1,184 @@
+name: kiwan ishere
+# Manual trigger only. Requires the target domain as input.
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Target domain (must be explicitly authorized for testing, e.g. example.com)'
+        required: true
+        type: string
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      DOMAIN: ${{ inputs.domain }}
+      WORKDIR: recon_work
+      GOPATH: /home/runner/go
+      GOBIN: /home/runner/go/bin
+
+    steps:
+      # ------------------------------------------------------------------
+      # 0. Setup
+      # ------------------------------------------------------------------
+      - name: Confirm authorization
+        run: |
+          echo "=================================================================="
+          echo " This workflow must only be run against domains/assets you have"
+          echo " explicit written authorization to test (bug bounty scope, pentest"
+          echo " engagement, or assets you own). Target: ${DOMAIN}"
+          echo "=================================================================="
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Add Go bin to PATH
+        run: echo "${GOBIN}" >> "$GITHUB_PATH"
+
+      - name: Create working directories
+        run: |
+          mkdir -p "${WORKDIR}/tmp_subdomains"
+          mkdir -p "${WORKDIR}/tmp_urls"
+          echo "Working directory structure created under ${WORKDIR}"
+
+      # ------------------------------------------------------------------
+      # 1. Install tools
+      # ------------------------------------------------------------------
+      - name: Install subfinder
+        run: |
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          subfinder -version || true
+
+      - name: Install gau
+        run: |
+          go install -v github.com/lc/gau/v2/cmd/gau@latest
+          gau --version || true
+
+      - name: Install waybackurls
+        run: |
+          go install -v github.com/tomnomnom/waybackurls@latest
+          echo "waybackurls installed"
+
+      # ------------------------------------------------------------------
+      # 2. Subdomain enumeration
+      # ------------------------------------------------------------------
+      - name: Run subfinder
+        run: |
+          echo "[*] Running subfinder against ${DOMAIN}"
+          subfinder -d "${DOMAIN}" -silent -all \
+            -o "${WORKDIR}/tmp_subdomains/subfinder.txt" || \
+            echo "[!] subfinder failed or returned no results, continuing"
+
+          # Ensure file exists even on failure so later stages don't break
+          touch "${WORKDIR}/tmp_subdomains/subfinder.txt"
+
+      - name: Merge and deduplicate subdomains
+        run: |
+          echo "[*] Merging subdomain results"
+          cat "${WORKDIR}"/tmp_subdomains/*.txt 2>/dev/null \
+            | tr -d '\r' \
+            | sed '/^\s*$/d' \
+            | sort -u > subdomains.txt
+
+          # Always ensure the root domain itself is included
+          echo "${DOMAIN}" >> subdomains.txt
+          sort -u -o subdomains.txt subdomains.txt
+
+          COUNT=$(wc -l < subdomains.txt)
+          echo "[+] Total unique subdomains: ${COUNT}"
+
+      - name: Upload subdomains as intermediate artifact
+        run: cp subdomains.txt "${WORKDIR}/subdomains.txt"
+
+      # ------------------------------------------------------------------
+      # 3. URL collection (gau + waybackurls) run in parallel per tool
+      # ------------------------------------------------------------------
+      - name: Run gau against all subdomains
+        continue-on-error: true
+        run: |
+          echo "[*] Running gau against all subdomains (this may take a while)"
+          # gau accepts a list of hosts via stdin; --threads controls concurrency
+          # to avoid overloading the runner or hammering targets too hard.
+          cat subdomains.txt | gau --threads 10 --timeout 15 \
+            > "${WORKDIR}/tmp_urls/gau.txt" 2>gau_errors.log || \
+            echo "[!] gau exited with an error, continuing pipeline"
+
+          touch "${WORKDIR}/tmp_urls/gau.txt"
+          echo "[+] gau collected $(wc -l < "${WORKDIR}/tmp_urls/gau.txt") URLs"
+
+      - name: Run waybackurls against all subdomains
+        continue-on-error: true
+        run: |
+          echo "[*] Running waybackurls against all subdomains"
+          # waybackurls processes stdin sequentially per host; it has no
+          # built-in concurrency flag, so we parallelize manually with xargs
+          # while capping concurrency to avoid overloading the runner.
+          cat subdomains.txt | xargs -P 8 -I{} sh -c \
+            'echo {} | waybackurls 2>>wayback_errors.log' \
+            > "${WORKDIR}/tmp_urls/waybackurls.txt" || \
+            echo "[!] waybackurls exited with an error, continuing pipeline"
+
+          touch "${WORKDIR}/tmp_urls/waybackurls.txt"
+          echo "[+] waybackurls collected $(wc -l < "${WORKDIR}/tmp_urls/waybackurls.txt") URLs"
+
+      # ------------------------------------------------------------------
+      # 4. Merge, clean, deduplicate all URLs
+      # ------------------------------------------------------------------
+      - name: Merge and clean URL results
+        run: |
+          echo "[*] Merging URL sources into all_urls.txt"
+          cat "${WORKDIR}/tmp_urls/gau.txt" "${WORKDIR}/tmp_urls/waybackurls.txt" 2>/dev/null \
+            | tr -d '\r' \
+            | sed '/^\s*$/d' \
+            | grep -E '^https?://' \
+            | sort -u > all_urls.txt
+
+          touch all_urls.txt
+          COUNT=$(wc -l < all_urls.txt)
+          echo "[+] Total unique cleaned URLs: ${COUNT}"
+
+      # ------------------------------------------------------------------
+      # 5. Extract JavaScript file URLs
+      # ------------------------------------------------------------------
+      - name: Extract JavaScript URLs
+        run: |
+          echo "[*] Extracting JavaScript file URLs from all_urls.txt"
+          # Matches:
+          #   ...file.js            (ends in .js, optionally with other extensions like .min.js)
+          #   ...file.js?query=...  (.js followed by a query string)
+          # Case-insensitive, so .JS / .Js also match.
+          grep -iE '\.js(\?[^ ]*)?$' all_urls.txt | sort -u > js_urls.txt
+
+          touch js_urls.txt
+          COUNT=$(wc -l < js_urls.txt)
+          echo "[+] Total unique JS URLs: ${COUNT}"
+
+      # ------------------------------------------------------------------
+      # 6. Summary logging
+      # ------------------------------------------------------------------
+      - name: Print summary
+        run: |
+          echo "=================== RECON SUMMARY ==================="
+          echo "Target domain      : ${DOMAIN}"
+          echo "Subdomains found   : $(wc -l < subdomains.txt)"
+          echo "Total URLs found   : $(wc -l < all_urls.txt)"
+          echo "JS URLs found      : $(wc -l < js_urls.txt)"
+          echo "======================================================="
+
+      # ------------------------------------------------------------------
+      # 7. Upload final artifacts
+      # ------------------------------------------------------------------
+      - name: Upload results as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: recon-results-${{ inputs.domain }}
+          path: |
+            subdomains.txt
+            all_urls.txt
+            js_urls.txt
+          if-no-files-found: warn
+          retention-days: 14
